@@ -1,6 +1,6 @@
 # OmaSpaces
 
-![OmaSpaces — At Work tooltip on the Omarchy bar](preview.png)
+![OmaSpaces panel — At Work and At Home spaces](preview.png)
 
 Workspace profiles for the Omarchy bar. One click on the grid icon, pick
 **At Work**, and Chrome opens on workspace 1, X on 2, WhatsApp on 3 — every
