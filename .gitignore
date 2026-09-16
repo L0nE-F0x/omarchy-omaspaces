@@ -1,0 +1,5 @@
+*.bak*
+*.qml.bak*
+__pycache__/
+*.pyc
+.DS_Store

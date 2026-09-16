@@ -1,0 +1,18 @@
+#!/bin/bash
+# apex-forge-keep
+# Apply the OmaSpaces profile flagged "Apply this space at login", if any.
+#
+# post-boot.d runs once per desktop start, which is the only place this belongs:
+# the shell itself restarts on updates and on every plugin edit, so applying a
+# space from QML startup would reopen apps at moments the user never asked for.
+#
+# No-ops when no profile carries the flag.
+set -euo pipefail
+
+engine="$HOME/.config/omarchy/plugins/lonefox.omaspaces/omaspaces"
+[[ -x $engine ]] || exit 0
+
+# Give Hyprland and the shell a moment to finish coming up, otherwise the first
+# window races the bar and lands wherever the compositor happens to be.
+sleep 3
+exec "$engine" login

@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+# apex-forge-keep
+#
+# OmaSpaces engine: apply a named workspace profile, or capture the current
+# desktop into one.
+#
+# Why a sidecar and not QML: applying a profile is a slow, sequential,
+# window-by-window negotiation with Hyprland (launch, wait for the window to
+# map, correct it if it landed wrong). That is far easier to reason about --
+# and to run from a keybinding or a boot hook -- as a script than as a chain
+# of QML timers. The panel only draws; this file does the work.
+#
+# The one non-obvious rule this engine exists to enforce:
+#
+#   Hyprland's initial_workspace_tracking cannot place every window.
+#   `hl.dsp.exec_cmd(cmd, { workspace = "3 silent" })` passes
+#   HL_INITIAL_WORKSPACE_TOKEN to the process it spawns, so the window that
+#   process opens maps on workspace 3. But a Chrome web app (--app=URL) is
+#   *not* opened by the spawned process: the already-running browser gets the
+#   request over its singleton socket and opens the window itself, with no
+#   token. It lands on whatever workspace is focused instead.
+#
+# So every launch is verified: wait for the new window, and if it did not land
+# on the target, move it there explicitly. The token path still runs first
+# because when it works the window never flickers on the wrong workspace.
+#
+# Usage:
+#   omaspaces list                 profiles, one per line
+#   omaspaces apply <id>           apply a profile (progress as JSON lines)
+#   omaspaces capture <name>       snapshot the live desktop into a new profile
+#   omaspaces login                apply the profile flagged applyOnLogin
+#   omaspaces path                 print the config path
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+    "omarchy", "omaspaces.json",
+)
+
+# A cold Chrome or Steam can take a while to put a window on screen; a missing
+# app should not stall the whole profile either.
+DEFAULT_TIMEOUT = 20.0
+POLL = 0.2
+SETTLE = 0.25
+
+BROWSER_RE = re.compile(r"chrom|brave|edge|vivaldi|opera|helium", re.I)
+BROWSER_APP_CLASS_RE = re.compile(
+    r"^(?:chrome|chromium|brave|msedge|vivaldi|opera|helium)-([^_]+)_", re.I
+)
+FIELD_CODE_RE = re.compile(r"%[fFuUdDnNickvm]")
+
+
+# --------------------------------------------------------------------- config
+
+def default_config():
+    return {"version": 1, "profiles": []}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return default_config()
+    if not isinstance(cfg, dict):
+        return default_config()
+    cfg.setdefault("version", 1)
+    if not isinstance(cfg.get("profiles"), list):
+        cfg["profiles"] = []
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def find_profile(cfg, ident):
+    want = str(ident or "").strip().lower()
+    for p in cfg.get("profiles", []):
+        if str(p.get("id", "")).lower() == want:
+            return p
+    for p in cfg.get("profiles", []):
+        if str(p.get("name", "")).lower() == want:
+            return p
+    return None
+
+
+def slugify(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()).strip("-")
+    return slug or "profile"
+
+
+def unique_id(cfg, base):
+    taken = {str(p.get("id", "")) for p in cfg.get("profiles", [])}
+    if base not in taken:
+        return base
+    n = 2
+    while "%s-%d" % (base, n) in taken:
+        n += 1
+    return "%s-%d" % (base, n)
+
+
+# -------------------------------------------------------------------- hyprland
+
+def hyprctl_json(*args):
+    try:
+        out = subprocess.run(
+            ["hyprctl", "-j"] + list(args),
+            capture_output=True, text=True, timeout=10,
+        )
+        return json.loads(out.stdout or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def dispatch(lua):
+    try:
+        out = subprocess.run(
+            ["hyprctl", "dispatch", lua],
+            capture_output=True, text=True, timeout=10,
+        )
+        return (out.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return "error"
+
+
+def lua_literal(text):
+    """Quote an arbitrary command as a Lua long string.
+
+    Long brackets need a level that does not appear in the payload, otherwise a
+    command containing ]=] would terminate the literal early.
+    """
+    level = 1
+    while ("]" + "=" * level + "]") in text:
+        level += 1
+    eq = "=" * level
+    return "[%s[%s]%s]" % (eq, text, eq)
+
+
+def clients():
+    rows = hyprctl_json("clients")
+    out = []
+    for c in rows if isinstance(rows, list) else []:
+        ws = c.get("workspace") or {}
+        out.append({
+            "address": c.get("address", ""),
+            "class": c.get("class", "") or c.get("initialClass", "") or "",
+            "title": c.get("title", "") or "",
+            "workspace": ws.get("id", 0),
+            "pid": c.get("pid", 0),
+        })
+    return out
+
+
+def focused_workspace():
+    ws = hyprctl_json("activeworkspace")
+    if isinstance(ws, dict):
+        return int(ws.get("id", 1) or 1)
+    return 1
+
+
+def exec_on_workspace(cmd, workspace):
+    return dispatch(
+        'hl.dsp.exec_cmd(%s, { workspace = "%d silent" })'
+        % (lua_literal(cmd), int(workspace))
+    )
+
+
+def move_window(address, workspace):
+    return dispatch(
+        'hl.dsp.window.move({ workspace = "%d", window = "address:%s", silent = true })'
+        % (int(workspace), address)
+    )
+
+
+def close_window(address):
+    return dispatch('hl.dsp.window.close({ window = "address:%s" })' % address)
+
+
+def focus_workspace(workspace):
+    return dispatch('hl.dsp.focus({ workspace = "%d" })' % int(workspace))
+
+
+# -------------------------------------------------------------- desktop entries
+
+def desktop_dirs():
+    dirs = [
+        os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share")), "applications"),
+        os.path.join(HOME, ".nix-profile/share/applications"),
+        "/usr/local/share/applications",
+        "/usr/share/applications",
+        os.path.join(HOME, ".local/share/flatpak/exports/share/applications"),
+        "/var/lib/flatpak/exports/share/applications",
+    ]
+    seen, out = set(), []
+    for d in dirs:
+        real = os.path.realpath(d)
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        out.append(d)
+    return out
+
+
+def parse_desktop_file(path):
+    """Read the [Desktop Entry] group only; later groups are actions."""
+    entry, in_group = {}, False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    in_group = line == "[Desktop Entry]"
+                    continue
+                if not in_group or "=" not in line or line.startswith("#"):
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                # Ignore localized keys (Name[de]) so the C locale wins.
+                if "[" in key:
+                    continue
+                entry.setdefault(key, value.strip())
+    except OSError:
+        return None
+    return entry
+
+
+def desktop_index():
+    """Map lowercased desktop id -> entry. Earlier dirs win (user overrides)."""
+    index = {}
+    for d in desktop_dirs():
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".desktop"):
+                continue
+            entry_id = name[: -len(".desktop")]
+            key = entry_id.lower()
+            if key in index:
+                continue
+            raw = parse_desktop_file(os.path.join(d, name))
+            if not raw or raw.get("Type", "Application") != "Application":
+                continue
+            index[key] = {
+                "id": entry_id,
+                "name": raw.get("Name", entry_id),
+                "exec": raw.get("Exec", ""),
+                "icon": raw.get("Icon", ""),
+                "terminal": raw.get("Terminal", "false").lower() == "true",
+                "nodisplay": raw.get("NoDisplay", "false").lower() == "true"
+                             or raw.get("Hidden", "false").lower() == "true",
+            }
+    return index
+
+
+def launch_command(entry):
+    """The Exec line with field codes stripped, wrapped for terminal apps."""
+    cmd = FIELD_CODE_RE.sub("", str(entry.get("exec", ""))).strip()
+    cmd = re.sub(r"\s{2,}", " ", cmd)
+    if not cmd:
+        return ""
+    if entry.get("terminal"):
+        term = os.environ.get("TERMINAL") or "ghostty"
+        return "%s -e %s" % (term, cmd)
+    return cmd
+
+
+def is_browser_entry(entry_id):
+    return bool(BROWSER_RE.search(str(entry_id or "")))
+
+
+def resolve_entry(cls, title, index):
+    """Best desktop entry for a live window.
+
+    Mirrors the matching lonefox.workspaces already does for its tooltips,
+    including Chrome's native-Wayland web app classes, which encode the site
+    host ("chrome-web.whatsapp.com__-Default") rather than the browser.
+    """
+    c = str(cls or "").lower()
+    if not c:
+        return None
+
+    if c in index:
+        return index[c]
+
+    tail = c.split(".")[-1] if "." in c else c
+    if tail in index:
+        return index[tail]
+
+    spaced = re.sub(r"[-_]+", " ", tail)
+    for entry in index.values():
+        if str(entry["name"]).lower() == spaced:
+            return entry
+
+    # Chrome web app: recover the site host from the class and match it against
+    # the launcher entry omarchy-webapp-install created (X.desktop -> "X").
+    m = BROWSER_APP_CLASS_RE.match(c)
+    if m:
+        host = m.group(1).lower()
+        labels = host.split(".")
+        candidates = [host] + ([labels[-2]] if len(labels) >= 2 else [])
+        for want in candidates:
+            for entry in index.values():
+                if is_browser_entry(entry["id"]):
+                    continue
+                if str(entry["name"]).lower() == want:
+                    return entry
+
+    # XWayland-era fallback: a --app window classed as the browser itself, with
+    # the site name in the title ("Home / X").
+    t = str(title or "")
+    if t and BROWSER_RE.search(c):
+        if not re.search(r"[-–—]\s*(google chrome|chromium|brave|microsoft edge)\s*$", t, re.I):
+            t = re.sub(r"^\(\d+\)\s*", "", t)
+            for segment in re.split(r"\s*[/|·–—.]\s*", t):
+                seg = segment.strip().lower()
+                if not seg or len(seg) > 24:
+                    continue
+                for entry in index.values():
+                    if is_browser_entry(entry["id"]):
+                        continue
+                    if str(entry["name"]).lower() == seg:
+                        return entry
+    return None
+
+
+# ----------------------------------------------------------------------- apply
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def spec_matches(spec, win):
+    """Is this live window the one this spec would have opened?"""
+    cls = str(win["class"]).lower()
+    want_class = str(spec.get("matchClass", "")).lower()
+    if want_class:
+        if cls != want_class:
+            return False
+    else:
+        entry_id = str(spec.get("desktopId", "")).lower()
+        if not entry_id:
+            return False
+        tail = entry_id.split(".")[-1]
+        if cls != entry_id and cls.split(".")[-1] != tail:
+            return False
+    want_title = str(spec.get("matchTitle", "")).strip().lower()
+    if want_title and want_title not in str(win["title"]).lower():
+        return False
+    return True
+
+
+def wait_for_new_window(before, claimed, spec, timeout):
+    """Poll until a window that is not in `before` shows up.
+
+    Preference goes to one this spec would recognise, because a background app
+    can map a window of its own while we are waiting.
+    """
+    deadline = time.time() + timeout
+    fallback = None
+    while time.time() < deadline:
+        time.sleep(POLL)
+        for win in clients():
+            addr = win["address"]
+            if addr in before or addr in claimed:
+                continue
+            if spec_matches(spec, win):
+                return win
+            if fallback is None:
+                fallback = win
+        if fallback is not None:
+            # A window appeared but did not match. Give the expected one a
+            # moment more (Chrome maps a blank frame before it is classed),
+            # then take what we got.
+            grace = time.time() + 1.5
+            while time.time() < grace:
+                time.sleep(POLL)
+                for win in clients():
+                    if win["address"] in before or win["address"] in claimed:
+                        continue
+                    if spec_matches(spec, win):
+                        return win
+            return fallback
+    return None
+
+
+def apply_profile(cfg, profile, dry_run=False):
+    # Workspace order, ties broken by the order the user arranged them in.
+    ordered = [(int(a.get("workspace", 1) or 1), i, a)
+               for i, a in enumerate(profile.get("apps", []))
+               if isinstance(a, dict)]
+    ordered.sort(key=lambda t: (t[0], t[1]))
+    apps = [t[2] for t in ordered]
+    index = desktop_index()
+    total = len(apps)
+
+    emit({"event": "start", "profile": profile.get("name", ""), "total": total})
+    if total == 0:
+        emit({"event": "done", "profile": profile.get("name", ""),
+              "launched": 0, "moved": 0, "failed": 0, "empty": True})
+        return 0
+
+    live = clients()
+    claimed = set()
+    learned = False
+    counts = {"launched": 0, "moved": 0, "kept": 0, "failed": 0}
+
+    if profile.get("closeOthers"):
+        keep = set()
+        for spec in apps:
+            for win in live:
+                if win["address"] not in keep and spec_matches(spec, win):
+                    keep.add(win["address"])
+                    break
+        for win in live:
+            if win["address"] not in keep:
+                if not dry_run:
+                    close_window(win["address"])
+        if not dry_run:
+            time.sleep(0.6)
+            live = clients()
+
+    for i, spec in enumerate(apps):
+        target = int(spec.get("workspace", 1) or 1)
+        label = spec.get("label") or spec.get("desktopId") or "app"
+
+        existing = None
+        if not spec.get("allowDuplicate"):
+            for win in live:
+                if win["address"] in claimed:
+                    continue
+                if spec_matches(spec, win):
+                    existing = win
+                    break
+
+        if existing is not None:
+            claimed.add(existing["address"])
+            if existing["workspace"] == target:
+                counts["kept"] += 1
+                emit({"event": "app", "index": i + 1, "total": total,
+                      "label": label, "workspace": target, "action": "kept"})
+            else:
+                if not dry_run:
+                    move_window(existing["address"], target)
+                counts["moved"] += 1
+                emit({"event": "app", "index": i + 1, "total": total,
+                      "label": label, "workspace": target, "action": "moved"})
+            continue
+
+        cmd = str(spec.get("exec", "")).strip()
+        if not cmd:
+            entry = index.get(str(spec.get("desktopId", "")).lower())
+            cmd = launch_command(entry) if entry else ""
+        if not cmd:
+            counts["failed"] += 1
+            emit({"event": "app", "index": i + 1, "total": total, "label": label,
+                  "workspace": target, "action": "failed",
+                  "reason": "no launch command for " + str(spec.get("desktopId", ""))})
+            continue
+
+        emit({"event": "app", "index": i + 1, "total": total, "label": label,
+              "workspace": target, "action": "opening"})
+        if dry_run:
+            continue
+
+        # Focusing the target first is what makes Chrome web apps land right
+        # the first time: the browser opens its window wherever the compositor
+        # is focused, so being there beforehand avoids a visible hop. Apps that
+        # honour the workspace token do not care either way.
+        if profile.get("walkWorkspaces", True) and focused_workspace() != target:
+            focus_workspace(target)
+            time.sleep(0.15)
+
+        before = {w["address"] for w in clients()}
+        exec_on_workspace(cmd, target)
+        win = wait_for_new_window(before, claimed,
+                                  spec, float(spec.get("timeout", DEFAULT_TIMEOUT)))
+        if win is None:
+            counts["failed"] += 1
+            emit({"event": "app", "index": i + 1, "total": total, "label": label,
+                  "workspace": target, "action": "timeout"})
+            live = clients()
+            continue
+
+        claimed.add(win["address"])
+        counts["launched"] += 1
+        # The token did not stick (Chrome web apps, DBus-activated services):
+        # put the window where the profile asked for it.
+        if win["workspace"] != target:
+            move_window(win["address"], target)
+            counts["moved"] += 1
+        # Remember what this app is classed as, so the next apply recognises it
+        # as already open instead of starting a second copy.
+        if not spec.get("matchClass") and win["class"]:
+            spec["matchClass"] = win["class"]
+            learned = True
+        emit({"event": "app", "index": i + 1, "total": total, "label": label,
+              "workspace": target, "action": "opened", "class": win["class"]})
+        time.sleep(SETTLE)
+        live = clients()
+
+    if not dry_run:
+        end = profile.get("focusWorkspace")
+        if end:
+            focus_workspace(int(end))
+        elif apps:
+            focus_workspace(int(apps[0].get("workspace", 1) or 1))
+
+    if learned and not dry_run:
+        save_config(cfg)
+
+    emit({"event": "done", "profile": profile.get("name", ""), **counts})
+    return 0 if counts["failed"] == 0 else 1
+
+
+# --------------------------------------------------------------------- capture
+
+def capture(name):
+    cfg = load_config()
+    index = desktop_index()
+    apps, seen = [], set()
+
+    for win in sorted(clients(), key=lambda w: (w["workspace"], w["address"])):
+        ws = int(win["workspace"] or 0)
+        if ws <= 0:  # special / scratchpad workspaces
+            continue
+        key = (str(win["class"]).lower(), ws)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = resolve_entry(win["class"], win["title"], index)
+        if entry is None:
+            continue
+        apps.append({
+            "desktopId": entry["id"],
+            "label": entry["name"],
+            "icon": entry["icon"],
+            "workspace": ws,
+            "matchClass": win["class"],
+            "matchTitle": "",
+        })
+
+    profile = {
+        "id": unique_id(cfg, slugify(name)),
+        "name": str(name),
+        "apps": apps,
+        "focusWorkspace": apps[0]["workspace"] if apps else focused_workspace(),
+        "closeOthers": False,
+        "applyOnLogin": False,
+    }
+    cfg["profiles"].append(profile)
+    save_config(cfg)
+    emit({"event": "captured", "id": profile["id"], "name": profile["name"],
+          "apps": len(apps)})
+    return 0
+
+
+# ------------------------------------------------------------------------ main
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__ or "usage: omaspaces <list|apply|capture|login|path>", file=sys.stderr)
+        return 2
+    cmd = argv[1]
+
+    if cmd == "path":
+        print(CONFIG_PATH)
+        return 0
+
+    if cmd == "list":
+        for p in load_config().get("profiles", []):
+            print("%s\t%s\t%d apps" % (p.get("id", ""), p.get("name", ""),
+                                       len(p.get("apps", []))))
+        return 0
+
+    if cmd == "capture":
+        return capture(argv[2] if len(argv) > 2 else "New Space")
+
+    if cmd in ("apply", "dry-run"):
+        if len(argv) < 3:
+            print("usage: omaspaces apply <profile-id>", file=sys.stderr)
+            return 2
+        cfg = load_config()
+        profile = find_profile(cfg, argv[2])
+        if profile is None:
+            emit({"event": "error", "message": "no profile named " + argv[2]})
+            return 1
+        return apply_profile(cfg, profile, dry_run=(cmd == "dry-run"))
+
+    if cmd == "login":
+        cfg = load_config()
+        for p in cfg.get("profiles", []):
+            if p.get("applyOnLogin"):
+                return apply_profile(cfg, p)
+        return 0
+
+    print("unknown command: " + cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
