@@ -30,10 +30,17 @@
 #   omaspaces capture <name>       snapshot the live desktop into a new profile
 #   omaspaces login                apply the profile flagged applyOnLogin
 #   omaspaces path                 print the config path
+#   omaspaces compact              close workspace gaps once, right now
+#   omaspaces compact on|off|toggle|status
+#                                  switch automatic gap closing (compactWorkspaces)
+#   omaspaces watch                the gap-closing listener the panel runs
 
+import fcntl
 import json
 import os
 import re
+import select
+import socket
 import subprocess
 import sys
 import time
@@ -49,6 +56,10 @@ CONFIG_PATH = os.path.join(
 DEFAULT_TIMEOUT = 20.0
 POLL = 0.2
 SETTLE = 0.25
+
+# Closing several windows at once (or our own moves echoing back) arrives as a
+# burst of events; wait for it to go quiet, then compact once.
+DEBOUNCE = 0.1
 
 BROWSER_RE = re.compile(r"chrom|brave|edge|vivaldi|opera|helium", re.I)
 BROWSER_APP_CLASS_RE = re.compile(
@@ -180,7 +191,7 @@ def exec_on_workspace(cmd, workspace):
 
 def move_window(address, workspace):
     return dispatch(
-        'hl.dsp.window.move({ workspace = "%d", window = "address:%s", silent = true })'
+        'hl.dsp.window.move({ workspace = "%d", window = "address:%s", follow = false })'
         % (int(workspace), address)
     )
 
@@ -570,11 +581,169 @@ def capture(name):
     return 0
 
 
+# --------------------------------------------------------------------- compact
+#
+# Keeps numbered workspaces gap-free: when a window closes (or is moved away)
+# and leaves an empty workspace with occupied ones to its right, everything to
+# the right shifts one workspace left. If the focused workspace shifted, the
+# view follows it.
+#
+# The switch is `compactWorkspaces` in the config, so the panel, the CLI and a
+# running listener all see the same value. The panel runs `watch` only while
+# the switch is on; `watch` re-reads it anyway, so a stray copy (a shell that
+# died without reaping it) can never keep compacting after it is turned off.
+
+def runtime_dir():
+    return os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+APPLY_LOCK = os.path.join(runtime_dir(), "omaspaces-apply.lock")
+WATCH_LOCK = os.path.join(runtime_dir(), "omaspaces-watch.lock")
+
+
+def compact_enabled(cfg):
+    return cfg.get("compactWorkspaces") is True
+
+
+def hold_apply_lock():
+    """Mark an apply as running until the returned handle is closed.
+
+    Shared, so concurrent applies behave exactly as they did before; the
+    listener only asks whether anyone holds it.
+    """
+    try:
+        fh = open(APPLY_LOCK, "a")
+        fcntl.flock(fh, fcntl.LOCK_SH)
+        return fh
+    except OSError:
+        return None
+
+
+def apply_running():
+    """An apply moves and closes windows on purpose; compacting underneath it
+    would shuffle workspaces the engine is still verifying placement on."""
+    try:
+        fd = os.open(APPLY_LOCK, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def compact_workspaces():
+    """Renumber the occupied workspaces 1..n, keeping their order."""
+    rows = hyprctl_json("workspaces")
+    occupied = []
+    for ws in rows if isinstance(rows, list) else []:
+        wid = int(ws.get("id", 0) or 0)
+        # Special workspaces are negative; a named one keeps its name.
+        if wid <= 0 or str(ws.get("name", "")) != str(wid):
+            continue
+        if int(ws.get("windows", 0) or 0) > 0:
+            occupied.append(wid)
+    occupied.sort()
+    if not occupied:
+        return 0
+
+    active = focused_workspace()
+    # One snapshot is enough: every source workspace maps to a distinct lower
+    # target, so a window moved this pass is never picked up again.
+    wins = clients()
+    moved = 0
+    for target, wid in enumerate(occupied, start=1):
+        if wid == target:
+            continue
+        for win in wins:
+            if win["workspace"] == wid:
+                move_window(win["address"], target)
+                moved += 1
+        if wid == active:
+            focus_workspace(target)
+    return moved
+
+
+def event_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not sig:
+        return ""
+    return os.path.join(runtime_dir(), "hypr", sig, ".socket2.sock")
+
+
+def connect_events(path, attempts=50):
+    for _ in range(attempts):
+        if path and os.path.exists(path):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(path)
+                return sock
+            except OSError:
+                sock.close()
+        time.sleep(0.1)
+    return None
+
+
+def watch():
+    # Every bar loads the panel, so a second monitor starts a second listener.
+    # It waits here rather than exiting, and takes over if the first one goes
+    # away with its monitor.
+    lock = open(WATCH_LOCK, "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    path = event_socket()
+    sock = connect_events(path)
+    if sock is None:
+        print("omaspaces watch: no Hyprland event socket at %r" % path, file=sys.stderr)
+        return 1
+
+    buf = b""
+    due = None
+    while True:
+        timeout = None if due is None else max(0.0, due - time.monotonic())
+        ready, _, _ = select.select([sock], [], [], timeout)
+        if not ready:
+            due = None
+            if compact_enabled(load_config()) and not apply_running():
+                compact_workspaces()
+            continue
+        chunk = sock.recv(65536)
+        if not chunk:
+            return 0  # the compositor went away
+        buf += chunk
+        lines = buf.split(b"\n")
+        buf = lines.pop()
+        for line in lines:
+            if line.startswith((b"closewindow>>", b"movewindowv2>>")):
+                due = time.monotonic() + DEBOUNCE
+
+
+def compact_command(arg):
+    if arg in ("", "now"):
+        emit({"event": "compacted", "moved": compact_workspaces()})
+        return 0
+    cfg = load_config()
+    if arg == "status":
+        print("on" if compact_enabled(cfg) else "off")
+        return 0
+    if arg in ("on", "off", "toggle"):
+        on = (not compact_enabled(cfg)) if arg == "toggle" else arg == "on"
+        cfg["compactWorkspaces"] = on
+        save_config(cfg)
+        print("on" if on else "off")
+        return 0
+    print("usage: omaspaces compact [now|on|off|toggle|status]", file=sys.stderr)
+    return 2
+
+
 # ------------------------------------------------------------------------ main
 
 def main(argv):
     if len(argv) < 2:
-        print(__doc__ or "usage: omaspaces <list|apply|capture|login|path>", file=sys.stderr)
+        print(__doc__ or "usage: omaspaces <list|apply|capture|login|path|compact|watch>", file=sys.stderr)
         return 2
     cmd = argv[1]
 
@@ -600,14 +769,23 @@ def main(argv):
         if profile is None:
             emit({"event": "error", "message": "no profile named " + argv[2]})
             return 1
+        # Held until the process exits; the gap-closing listener waits it out.
+        apply_lock = hold_apply_lock() if cmd == "apply" else None
         return apply_profile(cfg, profile, dry_run=(cmd == "dry-run"))
 
     if cmd == "login":
         cfg = load_config()
         for p in cfg.get("profiles", []):
             if p.get("applyOnLogin"):
+                apply_lock = hold_apply_lock()
                 return apply_profile(cfg, p)
         return 0
+
+    if cmd == "compact":
+        return compact_command(argv[2] if len(argv) > 2 else "")
+
+    if cmd == "watch":
+        return watch()
 
     print("unknown command: " + cmd, file=sys.stderr)
     return 2

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lonefox.omaspaces",
   "name": "OmaSpaces",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "lonefox",
   "license": "MIT",
   "description": "Workspace profiles for the Omarchy bar. Pick \"At Work\" and every app you keep for work opens on the workspace you keep it on.",

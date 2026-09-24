@@ -57,10 +57,12 @@ All local. OmaSpaces does not phone home.
 |---|---|
 | `/usr/bin/python3` | `omaspaces` engine |
 | `hyprctl` | list clients, move windows, dispatch launches |
+| Hyprland event socket | *Close workspace gaps* only: noticing a window close |
 | Omarchy shell / Quickshell | bar widget and panel UI |
 
 No network, no downloads, no sudo. The engine talks only to the local
-Hyprland socket through `hyprctl`.
+Hyprland sockets: `hyprctl` for commands, and the event socket while
+*Close workspace gaps* is on.
 
 ## Using it
 
@@ -71,9 +73,11 @@ Hyprland socket through `hyprctl`.
   new space, apps and workspace numbers already filled in.
 - The **gear** on a row opens its editor: rename it, add or drop apps, change
   which workspace each one lands on.
+- **Close workspace gaps** at the bottom of the list is an on/off switch; see
+  below.
 - Keyboard, with the panel open: `1`–`9` apply that space, `↑`/`↓` and `Enter`
   do the same, `e` edits the highlighted space, `n` makes a new one, `c`
-  captures the current layout, `Esc` closes.
+  captures the current layout, `g` flips *Close workspace gaps*, `Esc` closes.
 
 Applying a space never closes anything by default. An app that is already
 running is moved to its workspace rather than started a second time.
@@ -87,6 +91,25 @@ running is moved to its workspace rather than started a second time.
 | Close everything else first | Closes every window that is not part of the space before opening it. Off by default. |
 | Apply this space at login | Runs this space once per boot, via the optional `post-boot.d` hook above. Only one space can hold it. |
 
+## Close workspace gaps
+
+Off by default. When it is on and a workspace in the middle empties — you
+close its last window, or move it away — every occupied workspace to its right
+shifts one to the left, so 1, 2, 4, 5 becomes 1, 2, 3, 4. If the workspace you
+are looking at moves, the view goes with it.
+
+- Only numbered workspaces are touched. Special (scratchpad) and named
+  workspaces stay where they are.
+- It reacts to a window closing or moving, never to a workspace switch, so
+  turning it on does not reshuffle anything until the next close.
+- It pauses while a space is being applied. A space that leaves a gap on
+  purpose (apps on 1, 2 and 5) keeps it until the next time a window closes.
+- Workspaces are renumbered as one sequence, whichever monitor they are on.
+
+The switch is stored as `compactWorkspaces` in `omaspaces.json`. While it is on,
+the panel keeps one `omaspaces watch` process running; turning it off, or
+removing the plugin, stops it. Nothing is added to your autostart.
+
 ## CLI
 
 The engine runs without the panel:
@@ -95,6 +118,16 @@ The engine runs without the panel:
 ~/.config/omarchy/plugins/lonefox.omaspaces/omaspaces list
 ~/.config/omarchy/plugins/lonefox.omaspaces/omaspaces apply at-work
 ~/.config/omarchy/plugins/lonefox.omaspaces/omaspaces capture "Recording Content"
+~/.config/omarchy/plugins/lonefox.omaspaces/omaspaces compact           # close gaps once, now
+~/.config/omarchy/plugins/lonefox.omaspaces/omaspaces compact toggle    # or on / off / status
+```
+
+`compact toggle` is handy on a keybinding; the panel's switch follows it. For
+example, in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + CTRL + G", "Toggle workspace gap closing",
+  hl.dsp.exec_cmd(os.getenv("HOME") .. "/.config/omarchy/plugins/lonefox.omaspaces/omaspaces compact toggle"))
 ```
 
 ## How placement works
@@ -116,7 +149,7 @@ open.
 manifest.json              plugin metadata and bar-widget settings schema
 BarWidget.qml              the bar icon
 Panel.qml                  list of spaces and the per-space editor
-omaspaces                  engine: apply, capture, login (Python 3)
+omaspaces                  engine: apply, capture, login, compact, watch (Python 3)
 hooks/omaspaces-login.hook optional post-boot hook (copy into place yourself)
 preview.png                marketplace card image
 ```

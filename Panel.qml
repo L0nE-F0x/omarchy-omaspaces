@@ -16,6 +16,10 @@ import qs.Ui
 // The panel never launches an app itself. It shells out to ./omaspaces, which
 // reports progress as JSON lines; that keeps the slow part (waiting for a cold
 // Chrome to map a window) out of the shell process.
+//
+// The same goes for closing workspace gaps: the switch at the bottom of the
+// list only flips `compactWorkspaces` in the config, and while it is on the
+// panel keeps `omaspaces watch` running to do the actual work.
 Panel {
   id: root
   moduleName: "lonefox.omaspaces"
@@ -49,6 +53,7 @@ Panel {
   // inside a var, so every edit goes through mutate().
   property var cfg: ({ version: 1, profiles: [] })
   readonly property var profiles: cfg && Array.isArray(cfg.profiles) ? cfg.profiles : []
+  readonly property bool compactWorkspaces: cfg && cfg.compactWorkspaces === true
   property string lastFileJson: ""
 
   // --- view ----------------------------------------------------------------
@@ -261,6 +266,11 @@ Panel {
     root.mutateProfile(id, function(p) { p[key] = value })
   }
 
+  function toggleCompactWorkspaces() {
+    var on = !root.compactWorkspaces
+    root.mutate(function(next) { next.compactWorkspaces = on })
+  }
+
   // --- running the engine --------------------------------------------------
 
   function applyProfile(id) {
@@ -388,6 +398,33 @@ Panel {
     onTriggered: if (root.opened && root.busyId === "") root.close()
   }
 
+  // --- closing workspace gaps ----------------------------------------------
+  // The listener lives exactly as long as the switch is on and this panel is
+  // loaded: off stops it, and removing the plugin takes it down with the
+  // panel, so nothing outlives the plugin in an autostart entry.
+  function syncWatcher() {
+    var want = root.compactWorkspaces && root.enginePath !== ""
+    if (want !== watchProc.running) watchProc.running = want
+  }
+
+  onCompactWorkspacesChanged: root.syncWatcher()
+
+  Process {
+    id: watchProc
+    command: [root.enginePath, "watch"]
+    stderr: SplitParser { onRead: function(line) { console.warn("lonefox.omaspaces watch: " + line) } }
+    // Nothing stops it on purpose except the switch, so an exit while the
+    // switch is still on is a failure: try again rather than go quiet.
+    onRunningChanged: if (!running && root.compactWorkspaces) watchRetry.restart()
+  }
+
+  Timer {
+    id: watchRetry
+    interval: 2000
+    repeat: false
+    onTriggered: root.syncWatcher()
+  }
+
   // --- persistence ---------------------------------------------------------
 
   function persist() {
@@ -410,6 +447,7 @@ Panel {
         a.label = String(a.label || a.desktopId || "app")
       }
     }
+    cfg.compactWorkspaces = cfg.compactWorkspaces === true
     cfg.version = 1
     return cfg
   }
@@ -667,6 +705,7 @@ Panel {
       onTextKey: function(text) {
         if (root.view !== "list") return
         if (text === "c") { root.captureLayout(); return }
+        if (text === "g") { root.toggleCompactWorkspaces(); return }
         if (text === "n") { root.addProfile(); return }
         if (text === "e") {
           var sel = root.profiles[root.cursor]
@@ -911,6 +950,33 @@ Panel {
             fontSize: Style.font.caption
             enabled: root.busyId === ""
             onClicked: root.captureLayout()
+          }
+
+          // A Button rather than a bare switch so the whole row is the click
+          // target and its icon and label line up with Capture above it.
+          Button {
+            id: gapsRow
+            width: parent.width
+            height: Math.max(implicitHeight, gapsSwitch.implicitHeight + 2 * Style.spacing.controlPaddingY)
+            leftAlign: true
+            bordered: false
+            text: "Close workspace gaps"
+            iconText: "\uf066"
+            tooltipText: "When a workspace empties, shift the ones to its right left to fill it  (g)"
+            foreground: root.fg
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            fontSize: Style.font.caption
+            onClicked: root.toggleCompactWorkspaces()
+
+            ToggleSwitch {
+              id: gapsSwitch
+              anchors.right: parent.right
+              anchors.rightMargin: Style.spacing.controlPaddingX
+              anchors.verticalCenter: parent.verticalCenter
+              interactive: false
+              checked: root.compactWorkspaces
+              foreground: root.fg
+            }
           }
 
           Text {
